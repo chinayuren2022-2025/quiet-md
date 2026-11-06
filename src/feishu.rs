@@ -27,8 +27,11 @@ use std::path::{Path, PathBuf};
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Link {
     pub url: String,
-    /// The docx document token.
+    /// The docx document token (for a 知识库 link, the document it resolves to).
     pub token: String,
+    /// The 知识库 node token the link was pasted with (empty for a docx link).
+    #[serde(default)]
+    pub wiki_node: String,
     /// Cloud revision at the last sync (0: never synced, no base yet).
     #[serde(default)]
     pub revision: u64,
@@ -75,22 +78,71 @@ pub fn unlink(root: &Path, id: &str) {
     }
 }
 
-/// The docx token of a pasted link (or a bare token).
-pub fn token_of(url: &str) -> Result<String> {
+/// What a pasted link points at.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Pasted {
+    /// A docx token (`/docx/…`, or a bare token).
+    Docx(String),
+    /// A 知识库 node token (`/wiki/…`), resolved by `resolve_wiki`.
+    Wiki(String),
+}
+
+/// What a pasted link points at. No network: a wiki node is resolved later.
+pub fn parse_link(url: &str) -> Result<Pasted> {
     let url = url.trim();
     let tail = |key: &str| url.split(key).nth(1).map(|t| t.split(['?', '#', '/']).next().unwrap_or("").to_string());
+    let token_ok = |t: &String| t.len() >= 20 && t.chars().all(|c| c.is_ascii_alphanumeric());
     if url.contains("/wiki/") {
-        bail!("暂不支持知识库文档，请使用云空间里的文档链接");
+        return match tail("/wiki/") {
+            Some(t) if token_ok(&t) => Ok(Pasted::Wiki(t)),
+            _ => bail!("没有识别出飞书知识库链接"),
+        };
     }
     let token = match tail("/docx/") {
         Some(t) => t,
         None if url.contains("/docs/") || url.contains("/sheets/") || url.contains("/base/") => bail!("只支持新版飞书文档（链接里带 /docx/）"),
         None => url.to_string(),
     };
-    if token.len() < 20 || !token.chars().all(|c| c.is_ascii_alphanumeric()) {
+    if !token_ok(&token) {
         bail!("没有识别出飞书文档链接");
     }
-    Ok(token)
+    Ok(Pasted::Docx(token))
+}
+
+/// The docx token of a pasted docx link (or a bare token).
+pub fn token_of(url: &str) -> Result<String> {
+    match parse_link(url)? {
+        Pasted::Docx(t) => Ok(t),
+        Pasted::Wiki(_) => bail!("这里需要云空间里的文档链接"),
+    }
+}
+
+/// The docx behind a 知识库 node, from `wiki +node-get`. A shortcut is
+/// followed to its origin; other kinds of document are refused.
+fn resolve_wiki(root: &Path, node: &str) -> Result<String> {
+    let get = |n: &str| -> Result<serde_json::Value> { Ok(lark(root, &["wiki", "+node-get", "--node-token", n]).map_err(|e| anyhow!("找不到这篇知识库文档，或没有访问权限（{e}）"))?["data"].clone()) };
+    let mut d = get(node)?;
+    if d["node_type"].as_str() == Some("shortcut") {
+        let origin = d["origin_node_token"].as_str().filter(|s| !s.is_empty()).ok_or_else(|| anyhow!("知识库快捷方式没有指向原文档"))?;
+        d = get(origin)?;
+    }
+    let kind = d["obj_type"].as_str().unwrap_or_default();
+    if kind != "docx" {
+        bail!("知识库里的这篇文档是{}（{kind}），目前只支持新版文档（docx）", wiki_kind(kind));
+    }
+    d["obj_token"].as_str().filter(|s| !s.is_empty()).map(str::to_string).ok_or_else(|| anyhow!("知识库没有返回文档的标识"))
+}
+
+fn wiki_kind(t: &str) -> &str {
+    match t {
+        "sheet" => "表格",
+        "bitable" => "多维表格",
+        "mindnote" => "思维笔记",
+        "doc" => "旧版文档",
+        "file" => "文件",
+        "slides" => "幻灯片",
+        _ => "其他类型",
+    }
 }
 
 // ---------------------------------------------------------------- lark-cli
@@ -119,8 +171,9 @@ fn lark(root: &Path, args: &[&str]) -> Result<serde_json::Value> {
         Some(v) if out.status.success() && v["ok"].as_bool() != Some(false) => Ok(v),
         _ => {
             let err = String::from_utf8_lossy(&out.stderr);
-            let msg = serde_json::from_slice::<serde_json::Value>(&out.stdout).ok()
-                .and_then(|v| ["/error/message", "/error/msg", "/msg", "/message"].iter().find_map(|p| v.pointer(p)?.as_str().map(str::to_string)))
+            // lark-cli prints a failure as JSON on stderr; older versions used stdout.
+            let msg = [&out.stdout, &out.stderr].into_iter().filter_map(|b| serde_json::from_slice::<serde_json::Value>(b).ok())
+                .find_map(|v| ["/error/message", "/error/msg", "/msg", "/message"].iter().find_map(|p| v.pointer(p)?.as_str().map(str::to_string)))
                 .or_else(|| err.lines().rev().find(|l| !l.trim().is_empty()).map(str::to_string))
                 .unwrap_or_else(|| format!("退出码 {}", out.status));
             bail!("lark-cli {}：{msg}", args.iter().take(2).copied().collect::<Vec<_>>().join(" "))
@@ -133,6 +186,28 @@ fn new_images(doc: &Document, media: &Media) -> Vec<String> {
     doc.asset_sources().into_iter().filter(|s| s.contains('/') && !s.contains(':') && !media.values().any(|p| p == s)).collect()
 }
 
+/// `docs +media-download` for each token, four at a time. Replies come
+/// back in the order of `tokens`; the first failure is the error.
+fn download(root: &Path, tokens: &[String]) -> Result<Vec<serde_json::Value>> {
+    const WORKERS: usize = 4;
+    let mut got: Vec<(usize, Result<serde_json::Value>)> = std::thread::scope(|s| {
+        let workers: Vec<_> = (0..WORKERS.min(tokens.len()))
+            .map(|w| {
+                s.spawn(move || {
+                    (w..tokens.len()).step_by(WORKERS).map(|i| {
+                        let out = format!("assets/feishu-{}", tokens[i]);
+                        (i, lark(root, &["docs", "+media-download", "--token", &tokens[i], "--output", &out, "--overwrite"]))
+                    }).collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        // A panicked download must not shift the replies: propagate it.
+        workers.into_iter().flat_map(|h| h.join().expect("media download thread")).collect()
+    });
+    got.sort_by_key(|(i, _)| *i);
+    got.into_iter().map(|(_, r)| r).collect()
+}
+
 /// Fetch the cloud document. Images the library lacks are downloaded to
 /// `assets/`; one identical to a file just `uploaded` maps to that file.
 fn fetch(root: &Path, token: &str, media: &mut Media, uploaded: &[String]) -> Result<CloudDoc> {
@@ -140,12 +215,10 @@ fn fetch(root: &Path, token: &str, media: &mut Media, uploaded: &[String]) -> Re
     let d = &v["data"]["document"];
     let xml = d["content"].as_str().ok_or_else(|| anyhow!("飞书返回的内容里没有文档正文"))?;
     let revision = d["revision_id"].as_u64().unwrap_or(0);
-    for t in sync::image_tokens(xml) {
-        if media.contains_key(&t) {
-            continue;
-        }
+    let todo: Vec<String> = sync::image_tokens(xml).into_iter().filter(|t| !media.contains_key(t)).collect();
+    let replies = download(root, &todo)?;
+    for (t, v) in todo.into_iter().zip(replies) {
         let out = format!("assets/feishu-{t}");
-        let v = lark(root, &["docs", "+media-download", "--token", &t, "--output", &out, "--overwrite"])?;
         let saved = v["data"]["saved_path"].as_str().map(PathBuf::from).unwrap_or_else(|| root.join(&out));
         let saved = saved.canonicalize().unwrap_or(saved);
         let rel = saved.strip_prefix(root.canonicalize().unwrap_or_else(|_| root.to_path_buf())).map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| saved.to_string_lossy().into_owned());
@@ -224,13 +297,12 @@ fn sep() -> &'static str {
     if crate::settings::english() { "; " } else { "；" }
 }
 
-/// Why `doc` cannot go to the cloud, if it cannot.
-fn refuse(doc: &Document) -> Result<()> {
-    let b = sync::blockers(&doc.blocks);
-    if b.is_empty() {
+/// Refuses what the cloud cannot hold (`blockers`: the problems found).
+fn refuse(blockers: Vec<String>) -> Result<()> {
+    if blockers.is_empty() {
         return Ok(());
     }
-    bail!("文档里有飞书不支持的内容，未推送：{}", b.join("、"))
+    bail!("文档里有飞书不支持的内容，未推送：{}", blockers.join("、"))
 }
 
 impl Workspace {
@@ -270,7 +342,7 @@ impl Workspace {
 
     /// `doc` (the cloud side of a clash) as a page under `id`.
     fn sync_conflict_copy(&mut self, id: &str, mut doc: Document) -> Option<String> {
-        let (_, mo, d, h, mi) = crate::time::civil((crate::time::now() as i64 + crate::time::local_offset()) as u64);
+        let (_, mo, d, h, mi) = crate::time::civil(crate::time::now());
         let title = crate::settings::display_title(&doc.title.text);
         doc.title = RichText::plain(crate::localized_format!("{}（云端版本 {:02}-{:02} {:02}:{:02}）", "{} (cloud version {:02}-{:02} {:02}:{:02})", title, mo, d, h, mi));
         let copy = self.store.create_from(&doc).ok()?;
@@ -320,7 +392,7 @@ impl Workspace {
         let mut notes: Vec<String> = vec![];
         let (mut link, target, remote) = if mode == Mode::Create {
             let doc = this.update(cx, |w, cx| w.sync_doc_now(&id, cx))??;
-            refuse(&doc)?;
+            refuse(sync::blockers(&doc.blocks))?;
             let (r, i, d) = (root.clone(), id.clone(), doc.clone());
             let (token, url) = bg.spawn(async move { create(&r, &i, &d, &Media::new()) }).await?;
             (Link { url, token, ..Default::default() }, doc, None)
@@ -373,7 +445,9 @@ impl Workspace {
                     this.update(cx, |w, cx| w.sync_doc_now(&id, cx))??
                 }
             };
-            refuse(&target)?;
+            // Only the blocks a push sends: the rest are already in the cloud.
+            let (_, sent) = sync::plan_sent(&remote, &target, &link.media)?;
+            refuse(sync::blockers_in(&target.blocks, &sent))?;
             (link, target, Some(remote))
         };
         // Send what the cloud lacks, then read it back as the new base.
@@ -423,13 +497,46 @@ impl Workspace {
     }
 
     /// 关联飞书文档: remember the link, then take the cloud (an empty
-    /// document) or the side the user chose.
-    pub fn feishu_link(&mut self, id: &str, url: &str, mode: Mode, window: &mut Window, cx: &mut Context<Self>) -> Result<()> {
-        let token = token_of(url)?;
+    /// document) or the side the user chose. A 知识库 link is resolved in
+    /// the background first, and `Ok(true)` says the dialog waits for it.
+    pub fn feishu_link(&mut self, id: &str, url: &str, mode: Mode, window: &mut Window, cx: &mut Context<Self>) -> Result<bool> {
+        let pasted = parse_link(url)?;
         let url = if url.trim().starts_with("http") { url.trim().to_string() } else { String::new() };
-        save_link(&Store::root_dir(), id, &Link { url, token, ..Default::default() })?;
-        self.feishu_sync(id, mode, false, window, cx);
-        Ok(())
+        let node = match pasted {
+            Pasted::Docx(token) => {
+                save_link(&Store::root_dir(), id, &Link { url, token, ..Default::default() })?;
+                self.feishu_sync(id, mode, false, window, cx);
+                return Ok(false);
+            }
+            Pasted::Wiki(node) => node,
+        };
+        let (root, id) = (Store::root_dir(), id.to_string());
+        cx.spawn_in(window, async move |this, cx| {
+            let bg = cx.background_executor().clone();
+            let (r, n) = (root.clone(), node.clone());
+            let linked = match bg.spawn(async move { resolve_wiki(&r, &n) }).await {
+                Ok(token) => save_link(&root, &id, &Link { url, token, wiki_node: node, ..Default::default() }),
+                Err(e) => Err(e),
+            };
+            let _ = this.update_in(cx, |w, window, cx| match linked {
+                Ok(()) => {
+                    w.feishu_dlg = None;
+                    w.feishu_sync(&id, mode, false, window, cx);
+                }
+                Err(e) => w.feishu_link_failed(&e, cx),
+            });
+        })
+        .detach();
+        Ok(true)
+    }
+
+    /// Show `e` in the link dialog, which stays open for another try.
+    fn feishu_link_failed(&mut self, e: &anyhow::Error, cx: &mut Context<Self>) {
+        if let Some(d) = self.feishu_dlg.as_mut() {
+            d.busy = false;
+            d.error = Some(crate::settings::diagnostic(&e.to_string()));
+        }
+        cx.notify();
     }
 
     pub fn feishu_unlink(&mut self, id: &str, cx: &mut Context<Self>) {
@@ -449,6 +556,8 @@ pub struct LinkDialog {
     pub field: Entity<crate::input::TextField>,
     /// The document is empty: linking just pulls.
     pub blank: bool,
+    /// A 知识库 link is being resolved.
+    pub busy: bool,
     pub error: Option<String>,
     _subs: Vec<Subscription>,
 }
@@ -458,7 +567,7 @@ impl Workspace {
         self.doc_menu = false;
         self.doc_sub = None;
         let blank = self.sync_doc_now(id, cx).is_ok_and(|d| is_blank(&d));
-        let field = cx.new(|cx| crate::input::TextField::new("粘贴飞书文档链接", cx));
+        let field = cx.new(|cx| crate::input::TextField::new("粘贴飞书文档或知识库链接", cx));
         window.focus(&field.focus_handle(cx));
         let subs = vec![cx.subscribe_in(&field, window, |w, _, ev: &crate::input::TextFieldEvent, window, cx| match ev {
             crate::input::TextFieldEvent::Submit if w.feishu_dlg.as_ref().is_some_and(|d| d.blank) => w.feishu_link_submit(Mode::TakeCloud, window, cx),
@@ -468,15 +577,24 @@ impl Workspace {
             }
             _ => {}
         })];
-        self.feishu_dlg = Some(LinkDialog { id: id.to_string(), field, blank, error: None, _subs: subs });
+        self.feishu_dlg = Some(LinkDialog { id: id.to_string(), field, blank, busy: false, error: None, _subs: subs });
         cx.notify();
     }
 
     fn feishu_link_submit(&mut self, mode: Mode, window: &mut Window, cx: &mut Context<Self>) {
         let Some(d) = &self.feishu_dlg else { return };
+        if d.busy {
+            return;
+        }
         let (id, url) = (d.id.clone(), d.field.read(cx).text.clone());
         match self.feishu_link(&id, &url, mode, window, cx) {
-            Ok(()) => self.feishu_dlg = None,
+            Ok(false) => self.feishu_dlg = None,
+            Ok(true) => {
+                if let Some(d) = self.feishu_dlg.as_mut() {
+                    d.busy = true;
+                    d.error = None;
+                }
+            }
             Err(e) => {
                 if let Some(d) = self.feishu_dlg.as_mut() {
                     d.error = Some(crate::settings::diagnostic(&e.to_string()));
@@ -521,6 +639,7 @@ impl Workspace {
             .child(
                 div().px(px(24.)).pb(px(20.)).flex().flex_col().gap(px(10.)).text_size(px(13.)).line_height(px(20.))
                     .child(div().text_color(Theme::text_caption()).child(hint))
+                    .children(d.busy.then(|| div().text_color(Theme::text_caption()).child(crate::settings::text("正在查找知识库文档…"))))
                     .child(div().id("feishu-url").h(px(34.)).px(px(10.)).flex().items_center().rounded(px(6.)).border_1().border_color(Theme::line_border()).child(d.field.clone()))
                     .children(d.error.clone().map(|e| div().text_color(Theme::danger()).child(e))),
             )
@@ -542,18 +661,24 @@ impl Workspace {
         };
         match link_of(&Store::root_dir(), id) {
             Some(l) if l.revision > 0 => {
-                let (_, _, _, h, mi) = crate::time::civil((l.synced as i64 + crate::time::local_offset()) as u64);
+                let (_, _, _, h, mi) = crate::time::civil(l.synced);
                 let unlink_id = id.to_string();
-                menu.child(note(crate::localized_format!("已关联飞书 · {:02}:{:02} 同步", "Linked to Feishu · synced {:02}:{:02}", h, mi)))
+                let linked = if l.wiki_node.is_empty() {
+                    crate::localized_format!("已关联飞书 · {:02}:{:02} 同步", "Linked to Feishu · synced {:02}:{:02}", h, mi)
+                } else {
+                    crate::localized_format!("已关联飞书知识库 · {:02}:{:02} 同步", "Linked to a Feishu wiki · synced {:02}:{:02}", h, mi)
+                };
+                menu.child(note(linked))
                     .child(act("fs-pull", crate::settings::text("拉取云端更新"), Mode::Pull, id))
                     .child(act("fs-push", crate::settings::text("推送到飞书"), Mode::Push, id))
                     .child(act("fs-take-cloud", crate::settings::text("用云端覆盖本地"), Mode::TakeCloud, id))
                     .child(act("fs-take-local", crate::settings::text("用本地覆盖云端"), Mode::TakeLocal, id))
                     .child(sub_item("fs-unlink", crate::settings::text("取消关联")).on_click(cx.listener(move |w, _, _, cx| w.feishu_unlink(&unlink_id, cx))))
             }
-            Some(_) => {
+            Some(l) => {
                 let unlink_id = id.to_string();
-                menu.child(note(crate::settings::text("已关联，尚未同步").to_string()))
+                let linked = if l.wiki_node.is_empty() { crate::settings::text("已关联，尚未同步") } else { crate::settings::text("已关联飞书知识库，尚未同步") };
+                menu.child(note(linked.to_string()))
                     .child(act("fs-take-cloud", crate::settings::text("用云端覆盖本地"), Mode::TakeCloud, id))
                     .child(act("fs-take-local", crate::settings::text("用本地覆盖云端"), Mode::TakeLocal, id))
                     .child(sub_item("fs-unlink", crate::settings::text("取消关联")).on_click(cx.listener(move |w, _, _, cx| w.feishu_unlink(&unlink_id, cx))))
@@ -570,7 +695,7 @@ impl Workspace {
 #[cfg(test)]
 mod tests {
     // Not a glob: `gpui::test` would shadow `#[test]`.
-    use super::{Document, Link, Media, base_of, is_blank, link_of, save_base, save_link, sync, token_of, unlink};
+    use super::{Document, Link, Media, Pasted, base_of, is_blank, link_of, parse_link, save_base, save_link, sync, token_of, unlink};
 
     #[test]
     fn links_and_tokens() {
@@ -582,12 +707,29 @@ mod tests {
     }
 
     #[test]
+    fn pasted_links_by_shape() {
+        let docx = Pasted::Docx("DoxcnExampleDocumentToken1".into());
+        let wiki = Pasted::Wiki("WikcnExampleWikiNodeToken1".into());
+        assert_eq!(parse_link("https://x.feishu.cn/docx/DoxcnExampleDocumentToken1?from=from_copylink").unwrap(), docx);
+        assert_eq!(parse_link(" DoxcnExampleDocumentToken1 ").unwrap(), docx);
+        assert_eq!(parse_link("https://example.feishu.cn/wiki/WikcnExampleWikiNodeToken1").unwrap(), wiki);
+        assert_eq!(parse_link("https://x.feishu.cn/wiki/WikcnExampleWikiNodeToken1?from=from_copylink#share").unwrap(), wiki);
+        assert!(parse_link("https://x.feishu.cn/wiki/").is_err());
+        assert!(parse_link("https://x.feishu.cn/wiki/short").is_err());
+        assert!(parse_link("https://x.feishu.cn/sheets/shtcnExampleLegacyToken01").is_err());
+        assert!(parse_link("hello").is_err());
+    }
+
+    #[test]
     fn state_round_trips() {
         let root = std::env::temp_dir().join(format!("fdl-feishu-{}", std::process::id()));
-        let link = Link { url: "u".into(), token: "t".into(), revision: 7, media: Media::from([("tok".into(), "assets/a.png".into())]), synced: 1 };
+        let link = Link { url: "u".into(), token: "t".into(), wiki_node: "w".into(), revision: 7, media: Media::from([("tok".into(), "assets/a.png".into())]), synced: 1 };
         save_link(&root, "d", &link).unwrap();
         let back = link_of(&root, "d").unwrap();
-        assert_eq!((back.revision, back.media.get("tok").map(String::as_str)), (7, Some("assets/a.png")));
+        assert_eq!((back.revision, back.wiki_node.as_str(), back.media.get("tok").map(String::as_str)), (7, "w", Some("assets/a.png")));
+        // Links saved before wiki_node existed still load.
+        std::fs::write(root.join("sync/old.json"), r#"{"url":"","token":"t","revision":1}"#).unwrap();
+        assert!(link_of(&root, "old").unwrap().wiki_node.is_empty());
         let doc = crate::docxml::parse("<title>T</title><p>a</p><ul><li>b</li></ul>").unwrap();
         save_base(&root, "d", &doc).unwrap();
         assert_eq!(sync::keys(&base_of(&root, "d").unwrap().blocks), sync::keys(&doc.blocks));

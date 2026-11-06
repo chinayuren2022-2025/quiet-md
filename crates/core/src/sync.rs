@@ -365,7 +365,14 @@ pub enum Op {
 /// cloud-only attributes stay. Ops are in document order; each one only
 /// uses ids of blocks no earlier op touched.
 pub fn plan(remote: &CloudDoc, target: &Document, media: &Media) -> Result<Vec<Op>> {
+    Ok(plan_sent(remote, target, media)?.0)
+}
+
+/// [`plan`], and the ranges of `target` blocks its ops send (indices into
+/// `target.blocks`): the blocks the cloud has to accept, for [`blockers_in`].
+pub fn plan_sent(remote: &CloudDoc, target: &Document, media: &Media) -> Result<(Vec<Op>, Vec<std::ops::Range<usize>>)> {
     let mut out = Vec::new();
+    let mut ranges = Vec::new();
     let mut sent = target.clone();
     for_cloud(&mut sent.blocks, media);
     let (kr, kt) = (keys(&remote.doc.blocks), keys(&target.blocks));
@@ -376,6 +383,9 @@ pub fn plan(remote: &CloudDoc, target: &Document, media: &Media) -> Result<Vec<O
     let (mut ir, mut it) = (0, 0);
     for (sr, st) in lcs(&kr, &kt).into_iter().chain([(kr.len(), kt.len())]) {
         let xml = docxml::serialize_blocks_compact(&sent.blocks[it..st]);
+        if it < st {
+            ranges.push(it..st);
+        }
         match (ir < sr, it < st) {
             (true, true) => out.push(Op::Replace { start: id(ir)?, end: id(sr - 1)?, xml }),
             (true, false) => out.push(Op::Delete { start: id(ir)?, end: id(sr - 1)? }),
@@ -384,14 +394,27 @@ pub fn plan(remote: &CloudDoc, target: &Document, media: &Media) -> Result<Vec<O
         }
         (ir, it) = (sr + 1, st + 1);
     }
-    Ok(out)
+    Ok((out, ranges))
 }
 
 /// What the cloud cannot hold, by block: pushing is refused until these
 /// are gone (quiet.md's own blocks, and Feishu's limits on callouts).
 pub fn blockers(blocks: &[Block]) -> Vec<String> {
+    check_blockers(blocks, |_| true)
+}
+
+/// [`blockers`] for the blocks in `ranges` only (indices into `blocks`,
+/// numbered as in the document). Blocks a push does not send are not checked.
+pub fn blockers_in(blocks: &[Block], ranges: &[std::ops::Range<usize>]) -> Vec<String> {
+    check_blockers(blocks, |i| ranges.iter().any(|r| r.contains(&i)))
+}
+
+fn check_blockers(blocks: &[Block], checked: impl Fn(usize) -> bool) -> Vec<String> {
     let mut out = Vec::new();
     for (i, b) in blocks.iter().enumerate() {
+        if !checked(i) {
+            continue;
+        }
         let n = i + 1;
         let xml = docxml::serialize_blocks_compact(std::slice::from_ref(b));
         if xml.contains("<countdown") {

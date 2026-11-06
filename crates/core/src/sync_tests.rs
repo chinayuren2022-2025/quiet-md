@@ -258,3 +258,33 @@ fn neighbouring_edits_settle_block_by_block() {
     assert_eq!(texts(&m.doc), ["a 本地", "b", "c"]);
     assert_eq!(m.conflicts.len(), 1);
 }
+
+#[test]
+fn blockers_only_for_what_is_sent() {
+    // A callout holding a quote is already in the cloud: pushing other
+    // blocks does not send it, so it does not block.
+    let callout = "<callout emoji=\"💡\"><blockquote><p>q</p></blockquote></callout>";
+    let remote = cloud(&["<p>a</p>", callout, "<p>c</p>"]);
+    let target = doc(&["<p>a</p>", callout, "<p>C!</p>"]);
+    let (ops, sent) = plan_sent(&remote, &target, &Media::new()).unwrap();
+    assert_eq!(ops.len(), 1);
+    assert_eq!(sent, vec![2..3]);
+    assert!(blockers_in(&target.blocks, &sent).is_empty());
+    // The whole document does name it.
+    assert_eq!(blockers(&target.blocks).len(), 1);
+    // A new callout with a quote is sent, and blocks.
+    let target = doc(&["<p>a</p>", callout, "<p>c</p>", callout]);
+    let (_, sent) = plan_sent(&remote, &target, &Media::new()).unwrap();
+    assert_eq!(sent, vec![3..4]);
+    let b = blockers_in(&target.blocks, &sent);
+    assert!(b.len() == 1 && b[0].contains("第 4 块"), "{b:?}");
+    // Editing the old callout sends it again, and blocks too.
+    let edited = "<callout emoji=\"💡\"><blockquote><p>q2</p></blockquote></callout>";
+    let target = doc(&["<p>a</p>", edited, "<p>c</p>"]);
+    let (_, sent) = plan_sent(&remote, &target, &Media::new()).unwrap();
+    assert_eq!(sent, vec![1..2]);
+    assert!(blockers_in(&target.blocks, &sent)[0].contains("第 2 块"));
+    // Nothing to send, nothing checked.
+    let (ops, sent) = plan_sent(&remote, &remote.doc, &Media::new()).unwrap();
+    assert!(ops.is_empty() && sent.is_empty());
+}
